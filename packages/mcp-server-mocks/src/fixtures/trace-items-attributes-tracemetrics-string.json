@@ -1,0 +1,38 @@
+[
+  {
+    "key": "metric.name",
+    "name": "Metric Name"
+  },
+  {
+    "key": "metric.type",
+    "name": "Metric Type"
+  },
+  {
+    "key": "metric.unit",
+    "name": "Metric Unit"
+  },
+  {
+    "key": "transaction",
+    "name": "transaction"
+  },
+  {
+    "key": "project",
+    "name": "project"
+  },
+  {
+    "key": "environment",
+    "name": "environment"
+  },
+  {
+    "key": "http.method",
+    "name": "http.method"
+  },
+  {
+    "key": "fleet.region",
+    "name": "fleet.region"
+  },
+  {
+    "key": "fleet.deployment_region",
+    "name": "fleet.deployment_region"
+  }
+]

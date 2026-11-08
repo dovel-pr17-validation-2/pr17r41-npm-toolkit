@@ -1,0 +1,1440 @@
+import { mswServer } from "@sentry/mcp-server-mocks";
+import { HttpResponse, http } from "msw";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { z } from "zod";
+import { SentryApiService } from "../../../api-client";
+import * as logging from "../../../telem/logging";
+import {
+  createDatasetAttributesTool,
+  createValidateEventsSearchTool,
+  fetchCustomAttributes,
+  formatEventsValidationResults,
+  formatEventValue,
+  formatKnownUserValue,
+  isSemanticFilterDowngrade,
+  looksLikeSentrySearchSyntax,
+} from "./utils";
+
+describe("validateSearch tool contract", () => {
+  it("does not expose a separate environment argument", () => {
+    const tool = createValidateEventsSearchTool({
+      apiService: new SentryApiService({ accessToken: "test-token" }),
+      organizationSlug: "test-org",
+    });
+
+    const schema = tool.inputSchema as z.ZodObject;
+    expect(Object.keys(schema.shape)).not.toContain("environment");
+  });
+
+  it.each([
+    {
+      name: "does not add an environment filter when none is requested",
+      query: "span.duration:>100",
+    },
+    {
+      name: "preserves environment filters in the candidate query",
+      query: "span.duration:>100 environment:production",
+    },
+    {
+      name: "does not forward a hallucinated separate environment argument",
+      query: "span.duration:>100",
+      environment: ":/",
+    },
+  ])("$name", async ({ query, environment }) => {
+    const requests: URLSearchParams[] = [];
+    mswServer.use(
+      http.get(
+        "https://sentry.io/api/0/organizations/test-org/events/validate/",
+        ({ request }) => {
+          requests.push(new URL(request.url).searchParams);
+          return HttpResponse.json({
+            valid: true,
+            projects: [],
+            dataset: [],
+            environment: [],
+            field: [],
+            query: { valid: true, error: null, fields: [] },
+            orderby: [],
+          });
+        },
+      ),
+    );
+    const tool = createValidateEventsSearchTool({
+      apiService: new SentryApiService({ accessToken: "test-token" }),
+      organizationSlug: "test-org",
+    });
+    type ToolInput = Parameters<NonNullable<typeof tool.execute>>[0];
+    const schema = tool.inputSchema as z.ZodType<ToolInput>;
+    const input = schema.parse({
+      dataset: "spans",
+      query,
+      fields: ["span.duration"],
+      sort: "-span.duration",
+      environment,
+    });
+
+    const result = await tool.execute!(input, {
+      toolCallId: "validate-search-test",
+      messages: [],
+    });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.getAll("environment")).toEqual([]);
+    expect(requests[0]!.get("query")).toBe(query);
+    expect(result).toEqual({
+      result: { valid: true, message: "Search validation passed." },
+    });
+  });
+});
+
+describe("formatEventValue", () => {
+  describe("primitives", () => {
+    it("should return 'null' for null", () => {
+      expect(formatEventValue(null)).toBe("null");
+    });
+
+    it("should return 'undefined' for undefined", () => {
+      expect(formatEventValue(undefined)).toBe("undefined");
+    });
+
+    it("should return string values as-is", () => {
+      expect(formatEventValue("hello")).toBe("hello");
+    });
+
+    it("should stringify numbers", () => {
+      expect(formatEventValue(42)).toBe("42");
+      expect(formatEventValue(0)).toBe("0");
+      expect(formatEventValue(-1.5)).toBe("-1.5");
+    });
+
+    it("should stringify booleans", () => {
+      expect(formatEventValue(true)).toBe("true");
+      expect(formatEventValue(false)).toBe("false");
+    });
+  });
+
+  describe("strings", () => {
+    it("should collapse whitespace", () => {
+      expect(formatEventValue("hello   world")).toBe("hello world");
+      expect(formatEventValue("  leading")).toBe("leading");
+      expect(formatEventValue("trailing  ")).toBe("trailing");
+    });
+
+    it("should truncate long strings", () => {
+      const long = "a".repeat(300);
+      const result = formatEventValue(long);
+      expect(result.length).toBe(200);
+      expect(result).toMatch(/\.\.\.$/);
+    });
+
+    it("should respect custom maxLength", () => {
+      const result = formatEventValue("a".repeat(50), { maxLength: 20 });
+      expect(result.length).toBe(20);
+      expect(result).toMatch(/\.\.\.$/);
+    });
+  });
+
+  describe("arrays", () => {
+    it("should format empty arrays", () => {
+      expect(formatEventValue([])).toBe("[]");
+    });
+
+    it("should format tag-pair arrays", () => {
+      const tags = [
+        { key: "os", value: "iOS 17" },
+        { key: "device", value: "iPhone15,3" },
+      ];
+      expect(formatEventValue(tags)).toBe("os=iOS 17, device=iPhone15,3");
+    });
+
+    it("should format primitive arrays", () => {
+      expect(formatEventValue([1, 2, 3])).toBe("1, 2, 3");
+      expect(formatEventValue(["a", "b", "c"])).toBe("a, b, c");
+    });
+
+    it("should JSON-serialize mixed arrays", () => {
+      const result = formatEventValue([1, "two", { key: "val" }]);
+      expect(result).toContain("1");
+      expect(result).toContain("two");
+      expect(result).not.toContain("[object Object]");
+    });
+  });
+
+  describe("objects", () => {
+    it("should format user objects with identity fields", () => {
+      const user = {
+        id: "user-123",
+        email: "foo@example.com",
+        ip_address: "10.0.0.1",
+      };
+      const result = formatEventValue(user);
+      expect(result).toContain("id=user-123");
+      expect(result).toContain("email=foo@example.com");
+      expect(result).toContain("ip_address=10.0.0.1");
+    });
+
+    it("should include geo summaries for known user objects", () => {
+      const user = {
+        id: "3c7631c0121d40e79e2f992ff5cf7671",
+        geo: {
+          country_code: "US",
+          region: "United States",
+        },
+      };
+
+      expect(formatKnownUserValue(user, { includeGeo: true })).toContain(
+        "geo=US, United States",
+      );
+    });
+
+    it("should omit geo summaries for known user objects when requested", () => {
+      const user = {
+        id: "3c7631c0121d40e79e2f992ff5cf7671",
+        geo: {
+          country_code: "US",
+          region: "United States",
+        },
+      };
+
+      expect(formatKnownUserValue(user, { includeGeo: false })).toBe(
+        "id=3c7631c0121d40e79e2f992ff5cf7671",
+      );
+    });
+
+    it("should omit summary text for geo-only known users", () => {
+      const user = {
+        geo: {
+          country_code: "US",
+          region: "United States",
+        },
+      };
+
+      expect(formatKnownUserValue(user, { includeGeo: false })).toBeNull();
+    });
+
+    it("should NOT apply user formatting to objects with only id", () => {
+      const obj = { id: "abc", type: "transaction", description: "GET /api" };
+      const result = formatEventValue(obj);
+      // Should fall through to JSON, preserving all fields
+      expect(result).toContain("type");
+      expect(result).toContain("transaction");
+      expect(result).toContain("description");
+    });
+
+    it("should NOT apply user formatting to non-user objects with geo", () => {
+      const obj = {
+        method: "GET",
+        path: "/api/0/issues/",
+        geo: {
+          country_code: "US",
+        },
+      };
+
+      const result = formatEventValue(obj);
+      expect(result).toContain('"method":"GET"');
+      expect(result).toContain('"path":"/api/0/issues/"');
+      expect(result).toContain('"country_code":"US"');
+    });
+
+    it("should format tag-pair objects", () => {
+      const tag = { key: "browser", value: "Chrome 120" };
+      expect(formatEventValue(tag)).toBe("browser=Chrome 120");
+    });
+
+    it("should JSON-serialize arbitrary objects", () => {
+      const obj = { foo: "bar", count: 42 };
+      const result = formatEventValue(obj);
+      expect(result).toContain("foo");
+      expect(result).toContain("bar");
+      expect(result).not.toContain("[object Object]");
+    });
+
+    it("should handle circular references", () => {
+      const obj: Record<string, unknown> = { type: "test" };
+      obj.self = obj;
+      const result = formatEventValue(obj);
+      expect(result).toContain("[Circular]");
+      expect(result).not.toContain("[object Object]");
+    });
+  });
+
+  describe("truncation", () => {
+    it("should truncate objects exceeding maxLength", () => {
+      const obj = { key: "a".repeat(300) };
+      const result = formatEventValue(obj, { maxLength: 50 });
+      expect(result.length).toBe(50);
+      expect(result).toMatch(/\.\.\.$/);
+    });
+
+    it("should handle maxLength <= 3", () => {
+      const result = formatEventValue("abcdef", { maxLength: 3 });
+      expect(result).toBe("abc");
+    });
+  });
+});
+
+describe("search query helpers", () => {
+  it("should detect structured Sentry search syntax", () => {
+    expect(looksLikeSentrySearchSyntax("vpn connections from China")).toBe(
+      false,
+    );
+    expect(
+      looksLikeSentrySearchSyntax(
+        'transaction:"VPN connections" tags[type]:Unified tags[country]:CN',
+      ),
+    ).toBe(true);
+    expect(looksLikeSentrySearchSyntax("span.op:http.client")).toBe(true);
+    expect(looksLikeSentrySearchSyntax("http.status_code:500")).toBe(true);
+    expect(looksLikeSentrySearchSyntax("customer:acme")).toBe(true);
+    expect(looksLikeSentrySearchSyntax('!transaction:"healthcheck"')).toBe(
+      true,
+    );
+  });
+
+  it("should detect regex filters as structured Sentry search syntax", () => {
+    expect(
+      looksLikeSentrySearchSyntax(
+        String.raw`message://request took \d+ms//`,
+        "logs",
+      ),
+    ).toBe(true);
+    expect(
+      looksLikeSentrySearchSyntax(
+        String.raw`!message://worker \d+ ready//`,
+        "logs",
+      ),
+    ).toBe(true);
+    expect(
+      looksLikeSentrySearchSyntax(
+        String.raw`message://https?://api\.example\.com//`,
+        "logs",
+      ),
+    ).toBe(true);
+  });
+
+  it("should ignore common natural language colon patterns", () => {
+    expect(looksLikeSentrySearchSyntax("open http://example.com")).toBe(false);
+    expect(looksLikeSentrySearchSyntax("see http://example.com/a/")).toBe(
+      false,
+    );
+    expect(looksLikeSentrySearchSyntax("started at 10:30")).toBe(false);
+    expect(looksLikeSentrySearchSyntax("Note: show slow spans")).toBe(false);
+    expect(looksLikeSentrySearchSyntax("ERROR: service is down")).toBe(false);
+  });
+
+  it("should detect regex filters in logs queries", () => {
+    expect(looksLikeSentrySearchSyntax("message://^Timeout//", "logs")).toBe(
+      true,
+    );
+    expect(
+      looksLikeSentrySearchSyntax("message://^Timeout after \\d+ms//", "logs"),
+    ).toBe(true);
+    expect(
+      looksLikeSentrySearchSyntax("!message://(?i)healthcheck//", "logs"),
+    ).toBe(true);
+    expect(
+      looksLikeSentrySearchSyntax("open http://example.com/a//b", "logs"),
+    ).toBe(false);
+  });
+
+  it("does not treat URLs as regex filters when they end in a regex terminator", () => {
+    const queries = [
+      "errors from https://example.com/a// in checkout",
+      "requests to (http://example.com//)",
+      "uploads to s3://bucket and https://example.com//",
+      "errors from HTTP://example.com/a// in checkout",
+    ];
+
+    const results = queries.map((query) =>
+      looksLikeSentrySearchSyntax(query, "logs"),
+    );
+
+    expect(results).toEqual([false, false, false, false]);
+  });
+
+  it("allows rewriting natural language log queries that contain URLs", () => {
+    const query = "errors from https://example.com/a// in checkout";
+
+    const downgrade = isSemanticFilterDowngrade(
+      query,
+      'message:"*example.com/a*"',
+      "logs",
+    );
+
+    expect(downgrade).toBe(false);
+  });
+
+  // Which key shapes can carry a regex is tested with the grammar in
+  // @sentry/search-syntax (getsentry/sentry).
+  it("should detect regex filters and other filters inside parentheses", () => {
+    expect(looksLikeSentrySearchSyntax("(message://a b//)", "logs")).toBe(true);
+    // The parser reads filters inside parentheses like any other filter.
+    expect(looksLikeSentrySearchSyntax("(level:error)", "logs")).toBe(true);
+    expect(looksLikeSentrySearchSyntax("(level:error OR level:warning)")).toBe(
+      true,
+    );
+  });
+
+  it("should read structured filters the way Sentry's grammar does", () => {
+    expect(looksLikeSentrySearchSyntax("count():>10")).toBe(true);
+    expect(looksLikeSentrySearchSyntax("p95(span.duration):>200")).toBe(true);
+    expect(looksLikeSentrySearchSyntax("level:error\nchecking out")).toBe(true);
+    expect(looksLikeSentrySearchSyntax("meeting 10.30:45 tomorrow")).toBe(
+      false,
+    );
+    expect(looksLikeSentrySearchSyntax("level:")).toBe(false);
+  });
+
+  it("should not treat regex filters as search syntax outside logs", () => {
+    expect(looksLikeSentrySearchSyntax("message://^Timeout//")).toBe(false);
+    expect(
+      looksLikeSentrySearchSyntax("span.description://^GET \\/api//", "spans"),
+    ).toBe(false);
+    expect(looksLikeSentrySearchSyntax("message://^Timeout//", "errors")).toBe(
+      false,
+    );
+  });
+
+  it("detects regex filters rewritten into plain or wildcard filters", () => {
+    expect(
+      isSemanticFilterDowngrade(
+        "message://^Timeout//",
+        'message:"*Timeout*"',
+        "logs",
+      ),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "message://can't connect to \\w+//",
+        "message:*connect*",
+        "logs",
+      ),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "custom://^order-\\d+$// level:error",
+        'level:error message:"*order-*"',
+        "logs",
+      ),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "custom://^order-\\d+$//",
+        "custom:order-*",
+        "logs",
+      ),
+    ).toBe(true);
+
+    expect(
+      isSemanticFilterDowngrade(
+        "message://^Timeout//",
+        "message://^Timeout// severity:error",
+        "logs",
+      ),
+    ).toBe(false);
+    expect(
+      isSemanticFilterDowngrade(
+        "custom://^order-\\d+$//",
+        "tags[custom]://^order-\\d+$//",
+        "logs",
+      ),
+    ).toBe(false);
+  });
+
+  it("detects regex filter downgrades inside parentheses and on colon keys", () => {
+    expect(
+      isSemanticFilterDowngrade(
+        "severity:error (message://^Timeout after \\d+ms//)",
+        'severity:error message:"*Timeout after*"',
+        "logs",
+      ),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "tags[sentry:user]://^id \\d+//",
+        "tags[sentry:user]://^id//",
+        "logs",
+      ),
+    ).toBe(true);
+  });
+
+  it("detects regex filters rewritten into wildcards on array, quoted, and spaced keys", () => {
+    expect(
+      isSemanticFilterDowngrade("arr[*]://^a b//", "arr[*]:*a*", "logs"),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade('"mykey"://^a b//', '"mykey":*a*', "logs"),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "tags[k[*],array]://^a b//",
+        "tags[k[*],array]:*a*",
+        "logs",
+      ),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "tags[k[*],array]://^a b//",
+        'message:"*a b*"',
+        "logs",
+      ),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "tags[x, string]://^a b//",
+        'tags[x, string]:"*a*"',
+        "logs",
+      ),
+    ).toBe(true);
+  });
+
+  it("detects regex filters whose pattern changed case", () => {
+    expect(
+      isSemanticFilterDowngrade(
+        "message://^Timeout//",
+        "message://^timeout//",
+        "logs",
+      ),
+    ).toBe(true);
+  });
+
+  it("allows rewriting regex filters outside logs", () => {
+    expect(
+      isSemanticFilterDowngrade(
+        "span.description://^GET \\/api\\/\\d+//",
+        'span.description:"GET /api/*"',
+        "spans",
+      ),
+    ).toBe(false);
+    expect(
+      isSemanticFilterDowngrade(
+        "message://^Timeout//",
+        'message:"*Timeout*"',
+        "errors",
+      ),
+    ).toBe(false);
+  });
+
+  it("detects message full-text downgrades but allows real field renames", () => {
+    expect(
+      isSemanticFilterDowngrade("conv_id:ZYGC-86ZR", 'message:"*ZYGC-86ZR*"'),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "conv_id:ZYGC-86ZR",
+        "message:*ZYGC-86ZR* environment:prod",
+      ),
+    ).toBe(true);
+
+    // Legitimate typo/rename repairs must not be treated as downgrades.
+    expect(
+      isSemanticFilterDowngrade(
+        "spon.duration:>100 span.op:db",
+        "span.duration:>100 span.op:db",
+      ),
+    ).toBe(false);
+    expect(
+      isSemanticFilterDowngrade(
+        "tags[type]:Unified",
+        "tags[type]:Unified has:span.status",
+      ),
+    ).toBe(false);
+    expect(isSemanticFilterDowngrade("span.op:db AND", "span.op:db")).toBe(
+      false,
+    );
+
+    // Natural language input is not a structured-filter downgrade case.
+    expect(
+      isSemanticFilterDowngrade(
+        "errors mentioning ZYGC-86ZR",
+        'message:"*ZYGC-86ZR*"',
+      ),
+    ).toBe(false);
+
+    // message: inside a quoted value is not a full-text filter.
+    expect(
+      isSemanticFilterDowngrade(
+        "custom:hello",
+        'transaction:"handle message:hello"',
+      ),
+    ).toBe(false);
+
+    // Duplicate structured keys must still catch a partial full-text downgrade.
+    // Set-based key comparison would miss this because "custom" remains present.
+    expect(
+      isSemanticFilterDowngrade(
+        "custom:foo custom:bar",
+        'custom:bar message:"*foo*"',
+      ),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "custom:foo custom:foo",
+        'custom:foo message:"*foo*"',
+      ),
+    ).toBe(true);
+
+    // Keeping both structured values (or renaming one) is not a downgrade.
+    expect(
+      isSemanticFilterDowngrade(
+        "custom:foo custom:bar",
+        "custom:foo custom:bar environment:prod",
+      ),
+    ).toBe(false);
+    expect(
+      isSemanticFilterDowngrade(
+        "custom:foo custom:bar",
+        "tags[custom]:foo custom:bar",
+      ),
+    ).toBe(false);
+
+    // Quoted multi-word values must keep later words for downgrade detection.
+    // Truncating at the first space would miss message rewrites of "world".
+    expect(
+      isSemanticFilterDowngrade(
+        'transaction:"hello world"',
+        'message:"*world*"',
+      ),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "transaction:'hello world'",
+        'log.body:"*hello world*"',
+      ),
+    ).toBe(true);
+
+    // Bare substring matches are not enough — short values must not false-hit
+    // inside unrelated full-text (e.g. "1" inside "401").
+    expect(isSemanticFilterDowngrade("id:1", 'message:"error 401"')).toBe(
+      false,
+    );
+    expect(isSemanticFilterDowngrade("id:1", 'message:"error 1"')).toBe(true);
+  });
+
+  it("detects message regex downgrades of structured filters", () => {
+    expect(
+      isSemanticFilterDowngrade(
+        "http.status_code:500",
+        "message://status 500//",
+      ),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "user.id:42 severity:error",
+        String.raw`severity:error message://(?i)user 42 failed//`,
+      ),
+    ).toBe(true);
+
+    expect(
+      isSemanticFilterDowngrade(
+        "http.status_code:500",
+        String.raw`http.status_code:500 message://took \d+ms//`,
+      ),
+    ).toBe(false);
+
+    // A key:value inside a regex is pattern text, not a kept structured filter.
+    expect(
+      isSemanticFilterDowngrade("custom:foo", "message://custom:foo//"),
+    ).toBe(true);
+
+    // A quote inside a regex must not hide the filters after it.
+    expect(
+      isSemanticFilterDowngrade(
+        "custom:foo",
+        String.raw`message://it's \d+// message:"*foo*"`,
+      ),
+    ).toBe(true);
+  });
+
+  it("detects regex downgrades of structured filters on datasets other than logs", () => {
+    expect(
+      isSemanticFilterDowngrade(
+        "http.status_code:500",
+        "message://status 500//",
+        "errors",
+      ),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "span.op:db",
+        "span.description://db query//",
+        "spans",
+      ),
+    ).toBe(false);
+  });
+
+  it("detects message regex downgrades when the value casing differs", () => {
+    expect(
+      isSemanticFilterDowngrade(
+        "transaction:CheckoutFlow",
+        "message://(?i)CheckoutFlow//",
+        "logs",
+      ),
+    ).toBe(true);
+    expect(
+      isSemanticFilterDowngrade(
+        "user.email:Foo@example.com",
+        "message://Foo@example.com// severity:error",
+        "logs",
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("datasetAttributes tool pagination", () => {
+  beforeEach(() => {
+    mswServer.use(
+      http.get(
+        "https://sentry.io/api/0/organizations/test-org/trace-items/attributes/",
+        () =>
+          HttpResponse.json([
+            {
+              key: "custom.first",
+              name: "custom.first",
+              attributeType: "string",
+              attributeSource: { source_type: "user" },
+            },
+            {
+              key: "device.memory",
+              name: "device.memory",
+              attributeType: "number",
+              attributeSource: { source_type: "user" },
+              context: {
+                isConvention: true,
+                brief: "The estimated total memory capacity of the device.",
+                isDeprecated: false,
+              },
+            },
+          ]),
+      ),
+    );
+  });
+
+  afterEach(() => {
+    mswServer.resetHandlers();
+  });
+
+  async function listAttributes(offset?: number) {
+    const tool = createDatasetAttributesTool({
+      apiService: new SentryApiService({ accessToken: "test-token" }),
+      organizationSlug: "test-org",
+    });
+    type ToolInput = Parameters<NonNullable<typeof tool.execute>>[0];
+    const schema = tool.inputSchema as z.ZodType<ToolInput>;
+    const output = await tool.execute!(
+      schema.parse({ dataset: "spans", offset }),
+      {
+        toolCallId: "dataset-attributes-test",
+        messages: [],
+      },
+    );
+    return (output as { result: string }).result;
+  }
+
+  it("points to the next page when fields are past the first page", async () => {
+    const result = await listAttributes();
+
+    expect(result).toMatch(/Available Fields \(\d+ total, showing 1-50\):/);
+    expect(result).toContain(
+      "call datasetAttributes again with the same arguments and offset: 50",
+    );
+    expect(result).not.toContain("- device.memory (number): The estimated");
+    expect(result).toContain("EXAMPLE QUERIES FOR SPANS");
+  });
+
+  it("returns later pages with descriptions and types for their fields only", async () => {
+    const result = await listAttributes(50);
+
+    expect(result).toMatch(/showing 51-\d+\):/);
+    expect(result).toContain(
+      "- device.memory (number): The estimated total memory capacity of the device.",
+    );
+    expect(result).not.toContain("- span.op:");
+    expect(result).not.toContain("offset:");
+    expect(result).not.toContain("EXAMPLE QUERIES");
+  });
+
+  it("reports when the offset is past the last field", async () => {
+    const result = await listAttributes(1000);
+
+    expect(result).toMatch(
+      /Available Fields \(\d+ total\): none at offset 1000\./,
+    );
+  });
+});
+
+describe("fetchCustomAttributes", () => {
+  let apiService: SentryApiService;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(logging, "logWarn").mockImplementation(() => {});
+
+    // Create a real SentryApiService instance
+    apiService = new SentryApiService({
+      accessToken: "test-token",
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    mswServer.resetHandlers();
+  });
+
+  describe("403 permission errors", () => {
+    it("should throw 403 'no multi-project access' error as UserInputError", async () => {
+      // Mock the API to return a 403 error like in the Sentry issue
+      mswServer.use(
+        http.get(
+          "https://sentry.io/api/0/organizations/test-org/trace-items/attributes/",
+          () => {
+            return HttpResponse.json(
+              {
+                detail:
+                  "You do not have access to query across multiple projects. Please select a project for your query.",
+              },
+              { status: 403 },
+            );
+          },
+        ),
+      );
+
+      // Should throw ApiPermissionError with the improved error message
+      await expect(
+        fetchCustomAttributes(apiService, "test-org", "spans"),
+      ).rejects.toThrow(
+        "You do not have access to query across multiple projects. Please select a project for your query.",
+      );
+
+      // Should NOT log - the caller handles logging
+    });
+
+    it("should throw 403 errors for logs dataset", async () => {
+      mswServer.use(
+        http.get(
+          "https://sentry.io/api/0/organizations/test-org/trace-items/attributes/",
+          () => {
+            return HttpResponse.json(
+              { detail: "Permission denied" },
+              { status: 403 },
+            );
+          },
+        ),
+      );
+
+      // Should throw ApiPermissionError with the raw error message
+      await expect(
+        fetchCustomAttributes(apiService, "test-org", "logs", "project-123"),
+      ).rejects.toThrow("Permission denied");
+    });
+
+    it("should throw 404 errors for errors dataset", async () => {
+      mswServer.use(
+        http.get("https://sentry.io/api/0/organizations/test-org/tags/", () => {
+          return HttpResponse.json(
+            { detail: "Project not found" },
+            { status: 404 },
+          );
+        }),
+      );
+
+      // Should throw ApiNotFoundError with the raw error message
+      await expect(
+        fetchCustomAttributes(apiService, "test-org", "errors", "non-existent"),
+      ).rejects.toThrow("Project not found");
+    });
+  });
+
+  describe("5xx server errors", () => {
+    it("should re-throw 500 errors to be captured by Sentry", async () => {
+      mswServer.use(
+        http.get(
+          "https://sentry.io/api/0/organizations/test-org/trace-items/attributes/",
+          () => {
+            return HttpResponse.json(
+              { detail: "Internal server error" },
+              { status: 500 },
+            );
+          },
+        ),
+      );
+
+      // Should re-throw the error with the exact message (not wrapped as UserInputError)
+      const error = await fetchCustomAttributes(
+        apiService,
+        "test-org",
+        "spans",
+      ).catch((e) => e);
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toBe("Internal server error");
+    });
+
+    it("should re-throw 502 errors", async () => {
+      mswServer.use(
+        http.get("https://sentry.io/api/0/organizations/test-org/tags/", () => {
+          return HttpResponse.json({ detail: "Bad gateway" }, { status: 502 });
+        }),
+      );
+
+      const error = await fetchCustomAttributes(
+        apiService,
+        "test-org",
+        "errors",
+      ).catch((e) => e);
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toBe("Bad gateway");
+    });
+  });
+
+  describe("network errors", () => {
+    it("should re-throw network errors to be captured by Sentry", async () => {
+      mswServer.use(
+        http.get(
+          "https://sentry.io/api/0/organizations/test-org/trace-items/attributes/",
+          () => {
+            // Simulate network error by throwing
+            throw new Error("Network error: ETIMEDOUT");
+          },
+        ),
+      );
+
+      await expect(
+        fetchCustomAttributes(apiService, "test-org", "spans"),
+      ).rejects.toThrow("Network error: ETIMEDOUT");
+    });
+  });
+
+  describe("successful responses", () => {
+    it("should return attributes for spans dataset", async () => {
+      mswServer.use(
+        http.get(
+          "https://sentry.io/api/0/organizations/test-org/trace-items/attributes/",
+          ({ request }) => {
+            const url = new URL(request.url);
+            const itemType = url.searchParams.get("itemType");
+
+            if (!itemType) {
+              return HttpResponse.json(
+                { detail: "Missing required parameters" },
+                { status: 400 },
+              );
+            }
+
+            return HttpResponse.json([
+              {
+                key: "span.op",
+                name: "Operation",
+                attributeType: "string",
+                attributeSource: { source_type: "sentry" },
+              },
+              {
+                key: "sentry:internal",
+                name: "Internal",
+                attributeType: "string",
+                attributeSource: { source_type: "sentry" },
+              },
+              {
+                key: "span.duration",
+                name: "Duration",
+                attributeType: "number",
+                attributeSource: { source_type: "sentry" },
+              },
+            ]);
+          },
+        ),
+      );
+
+      const result = await fetchCustomAttributes(
+        apiService,
+        "test-org",
+        "spans",
+      );
+
+      expect(result).toEqual({
+        attributes: {
+          "span.duration": {
+            attributeSource: {
+              source_type: "sentry",
+            },
+            context: undefined,
+            key: "span.duration",
+            name: "Duration",
+            type: "number",
+          },
+          "span.op": {
+            attributeSource: {
+              source_type: "sentry",
+            },
+            context: undefined,
+            key: "span.op",
+            name: "Operation",
+            type: "string",
+          },
+        },
+        fieldTypes: {
+          "span.op": "string",
+          "span.duration": "number",
+        },
+      });
+    });
+
+    it("should return attributes for errors dataset", async () => {
+      mswServer.use(
+        http.get("https://sentry.io/api/0/organizations/test-org/tags/", () => {
+          return HttpResponse.json([
+            { key: "browser", name: "Browser", totalValues: 10 },
+            { key: "sentry:user", name: "User", totalValues: 5 }, // Should be filtered
+            { key: "environment", name: "Environment", totalValues: 3 },
+          ]);
+        }),
+      );
+
+      const result = await fetchCustomAttributes(
+        apiService,
+        "test-org",
+        "errors",
+      );
+
+      expect(result).toEqual({
+        attributes: {
+          browser: { key: "browser", name: "Browser", totalValues: 10 },
+          environment: {
+            key: "environment",
+            name: "Environment",
+            totalValues: 3,
+          },
+        },
+        fieldTypes: {},
+      });
+    });
+
+    it("should return attributes for metrics dataset", async () => {
+      mswServer.use(
+        http.get(
+          "https://sentry.io/api/0/organizations/test-org/trace-items/attributes/",
+          ({ request }) => {
+            const url = new URL(request.url);
+            const itemType = url.searchParams.get("itemType");
+
+            expect(itemType).toBe("tracemetrics");
+
+            return HttpResponse.json([
+              {
+                key: "metric.name",
+                name: "Metric Name",
+                attributeType: "string",
+                attributeSource: { source_type: "sentry" },
+              },
+              {
+                key: "metric.type",
+                name: "Metric Type",
+                attributeType: "string",
+                attributeSource: { source_type: "sentry" },
+              },
+              {
+                key: "value",
+                name: "Metric Value",
+                attributeType: "number",
+                attributeSource: { source_type: "sentry" },
+              },
+            ]);
+          },
+        ),
+      );
+
+      const result = await fetchCustomAttributes(
+        apiService,
+        "test-org",
+        "metrics",
+      );
+
+      expect(result).toEqual({
+        attributes: {
+          "metric.name": {
+            attributeSource: {
+              source_type: "sentry",
+            },
+            context: undefined,
+            key: "metric.name",
+            name: "Metric Name",
+            type: "string",
+          },
+          "metric.type": {
+            attributeSource: {
+              source_type: "sentry",
+            },
+            context: undefined,
+            key: "metric.type",
+            name: "Metric Type",
+            type: "string",
+          },
+          value: {
+            attributeSource: {
+              source_type: "sentry",
+            },
+            context: undefined,
+            key: "value",
+            name: "Metric Value",
+            type: "number",
+          },
+        },
+        fieldTypes: {
+          "metric.name": "string",
+          "metric.type": "string",
+          value: "number",
+        },
+      });
+    });
+
+    it("should pass targeted trace item attribute filters through to Sentry", async () => {
+      const requests: URLSearchParams[] = [];
+
+      mswServer.use(
+        http.get(
+          "https://sentry.io/api/0/organizations/test-org/trace-items/attributes/",
+          ({ request }) => {
+            const url = new URL(request.url);
+            requests.push(url.searchParams);
+
+            return HttpResponse.json([
+              {
+                key: "tags[type]",
+                name: "type",
+                attributeType: "string",
+                attributeSource: { source_type: "sentry" },
+              },
+              {
+                key: "tags[sequence,number]",
+                name: "sequence",
+                attributeType: "number",
+                attributeSource: { source_type: "user" },
+              },
+              {
+                key: "tags[enabled,boolean]",
+                name: "enabled",
+                attributeType: "boolean",
+                attributeSource: { source_type: "user" },
+              },
+            ]);
+          },
+        ),
+      );
+
+      const result = await fetchCustomAttributes(
+        apiService,
+        "test-org",
+        "spans",
+        "123",
+        { statsPeriod: "7d" },
+        {
+          attributeTypes: ["string", "number", "boolean"],
+          substringMatch: "tags[",
+          query: 'transaction:"VPN connections"',
+        },
+      );
+
+      expect(requests).toHaveLength(1);
+      expect(requests[0]!.get("attributeType")).toBeNull();
+      for (const params of requests) {
+        expect(params.get("itemType")).toBe("spans");
+        expect(params.get("project")).toBe("123");
+        expect(params.get("statsPeriod")).toBe("7d");
+        expect(params.get("substringMatch")).toBe("tags[");
+        expect(params.get("query")).toBe('transaction:"VPN connections"');
+      }
+      expect(result).toEqual({
+        attributes: {
+          "tags[enabled,boolean]": {
+            attributeSource: {
+              source_type: "user",
+            },
+            context: undefined,
+            key: "tags[enabled,boolean]",
+            name: "enabled",
+            type: "boolean",
+          },
+          "tags[sequence,number]": {
+            attributeSource: {
+              source_type: "user",
+            },
+            context: undefined,
+            key: "tags[sequence,number]",
+            name: "sequence",
+            type: "number",
+          },
+          "tags[type]": {
+            attributeSource: {
+              source_type: "sentry",
+            },
+            context: undefined,
+            key: "tags[type]",
+            name: "type",
+            type: "string",
+          },
+        },
+        fieldTypes: {
+          "tags[type]": "string",
+          "tags[sequence,number]": "number",
+          "tags[enabled,boolean]": "boolean",
+        },
+      });
+    });
+
+    it("should properly digest and return context when received from the attributes endpoint", async () => {
+      mswServer.use(
+        http.get(
+          "https://sentry.io/api/0/organizations/test-org/trace-items/attributes/?expand=context",
+          ({ request }) => {
+            const url = new URL(request.url);
+            const itemType = url.searchParams.get("itemType");
+
+            if (!itemType) {
+              return HttpResponse.json(
+                { detail: "Missing required parameters" },
+                { status: 400 },
+              );
+            }
+
+            return HttpResponse.json([
+              {
+                key: "span.op",
+                name: "Operation",
+                attributeType: "string",
+                attributeSource: { source_type: "sentry" },
+                context: {
+                  isConvention: true,
+                  isDeprecated: false,
+                  brief: "The operation of a span",
+                  examples: ["http.client"],
+                },
+              },
+              {
+                key: "sentry:internal",
+                name: "Internal",
+                attributeType: "string",
+                attributeSource: { source_type: "sentry" },
+                context: {},
+              },
+              {
+                key: "span.duration",
+                name: "Duration",
+                attributeType: "number",
+                attributeSource: { source_type: "sentry" },
+                context: {
+                  isConvention: false,
+                  brief: "The total time taken by the span.",
+                  isDeprecated: false,
+                },
+              },
+              {
+                key: "tags[app_start_type,string]",
+                name: "app_start_type",
+                attributeSource: {
+                  source_type: "user",
+                },
+                attributeType: "string",
+                context: {
+                  isConvention: true,
+                  brief: "Mobile app start variant. Either cold or warm.",
+                  isDeprecated: true,
+                  examples: ["cold"],
+                  replacementAttribute: "app.vitals.start.type",
+                },
+              },
+            ]);
+          },
+        ),
+      );
+
+      const result = await fetchCustomAttributes(
+        apiService,
+        "test-org",
+        "spans",
+        undefined,
+        undefined,
+        { context: true },
+      );
+
+      expect(result).toEqual({
+        attributes: {
+          "span.op": {
+            key: "span.op",
+            name: "Operation",
+            type: "string",
+            attributeSource: { source_type: "sentry" },
+            context: {
+              isConvention: true,
+              isDeprecated: false,
+              brief: "The operation of a span",
+              examples: ["http.client"],
+            },
+          },
+          "span.duration": {
+            key: "span.duration",
+            name: "Duration",
+            type: "number",
+            attributeSource: { source_type: "sentry" },
+            context: {
+              isConvention: false,
+              brief: "The total time taken by the span.",
+              isDeprecated: false,
+            },
+          },
+          "tags[app_start_type,string]": {
+            key: "tags[app_start_type,string]",
+            name: "app_start_type",
+            type: "string",
+            attributeSource: { source_type: "user" },
+            context: {
+              isConvention: true,
+              brief: "Mobile app start variant. Either cold or warm.",
+              isDeprecated: true,
+              examples: ["cold"],
+              replacementAttribute: "app.vitals.start.type",
+            },
+          },
+        },
+        fieldTypes: {
+          "span.op": "string",
+          "span.duration": "number",
+          "tags[app_start_type,string]": "string",
+        },
+      });
+    });
+  });
+});
+
+describe("formatEventsValidationResults", () => {
+  it("returns an empty string when there are no validation sections", () => {
+    expect(
+      formatEventsValidationResults({
+        valid: true,
+        projects: [],
+        dataset: [],
+        environment: [],
+        field: [],
+        query: { valid: true, fields: [] },
+        orderby: [],
+      }),
+    ).toBe("");
+  });
+
+  it("formats all validation sections for a mixed result", () => {
+    expect(
+      formatEventsValidationResults({
+        valid: false,
+        projects: [{ valid: true }],
+        dataset: [
+          {
+            name: "spans",
+            valid: false,
+            error: "dataset must be one of: spans, errors",
+          },
+        ],
+        environment: [{ valid: true }],
+        field: [
+          { name: "span.duration", valid: true, type: "number" },
+          {
+            name: "tags[missing]",
+            valid: false,
+            error: "Unknown attribute",
+          },
+        ],
+        query: {
+          valid: false,
+          error: "Invalid syntax",
+          fields: [{ name: "transaction", valid: true, type: "string" }],
+        },
+        orderby: [
+          {
+            name: "-spon.duration",
+            valid: false,
+            error: "Orderby must also be a selected field",
+          },
+        ],
+      }),
+    ).toBe(`Validation Result: invalid
+Validated Dataset:
+- INVALID spans — dataset must be one of: spans, errors
+
+Validated Fields:
+- INVALID tags[missing] — Unknown attribute
+
+Validated Query:
+- INVALID query — Invalid syntax
+
+Validated Order By:
+- INVALID -spon.duration — Orderby must also be a selected field
+`);
+  });
+
+  it("formats invalid query with invalid query fields", () => {
+    expect(
+      formatEventsValidationResults({
+        valid: false,
+        projects: [],
+        dataset: [],
+        environment: [],
+        field: [],
+        query: {
+          valid: false,
+          error: 'quotes are not closed at "VPN connections',
+          fields: [
+            { name: "hello", valid: false, error: "Unknown attribute" },
+            { name: "tags[fake]", valid: false, error: "Unknown attribute" },
+          ],
+        },
+        orderby: [],
+      }),
+    ).toBe(`Validation Result: invalid
+Validated Query:
+- INVALID query — quotes are not closed at "VPN connections
+  - INVALID hello — Unknown attribute
+  - INVALID tags[fake] — Unknown attribute
+`);
+  });
+
+  it("formats valid query field details when validation passes", () => {
+    expect(
+      formatEventsValidationResults({
+        valid: true,
+        projects: [],
+        dataset: [],
+        environment: [],
+        field: [],
+        query: {
+          valid: true,
+          fields: [{ name: "transaction", valid: true, type: "string" }],
+        },
+        orderby: [],
+      }),
+    ).toBe(`Validation Result: valid
+Validated Query:
+- OK query
+  - OK transaction — type: string
+`);
+  });
+
+  it("formats query-only validation failure", () => {
+    expect(
+      formatEventsValidationResults({
+        valid: false,
+        projects: [],
+        dataset: [],
+        environment: [],
+        field: [],
+        query: {
+          valid: false,
+          error: "Invalid syntax",
+          fields: [],
+        },
+        orderby: [],
+      }),
+    ).toBe(`Validation Result: invalid
+Validated Query:
+- INVALID query — Invalid syntax
+`);
+  });
+});

@@ -1,0 +1,1516 @@
+import { isAggregateFieldOrEquation } from "@sentry/toolkit-core/events-fields";
+import {
+  type FilterToken,
+  type ParseResultToken,
+  parseSearch,
+} from "@sentry/search-syntax/parser";
+import { TermOperator, Token } from "@sentry/search-syntax/tokens";
+import { getActiveSpan } from "@sentry/core";
+import { z } from "zod";
+import type {
+  EventsQueryValidation,
+  EventsValidationResult,
+  SentryApiService,
+  Tag,
+  TraceItemAttribute,
+  TraceItemAttributeContext,
+  TraceItemAttributeType,
+  TraceItemType,
+} from "../../../api-client";
+import { UserInputError } from "../../../errors";
+import {
+  agentTool,
+  recordAgentToolResultCount,
+} from "../../../internal/agents/tools/utils";
+import {
+  formatUserGeoSummary,
+  isPlainObject,
+} from "../../../internal/user-formatting";
+import {
+  type EventsDataset,
+  normalizeEventsDataset,
+  PUBLIC_EVENTS_DATASETS,
+} from "../../../utils/events-datasets";
+
+// Type for flexible event data that can contain any fields
+export type FlexibleEventData = Record<string, unknown>;
+
+const DEFAULT_MAX_VALUE_LENGTH = 200;
+const DEFAULT_MAX_ARRAY_ITEMS = 20;
+const FIELDS_PAGE_SIZE = 50;
+// Mirrors regex_value in Sentry's event_search.py grammar, which is what
+// separates a key://pattern// filter from prose like http://example.com.
+const REGEX_FILTER_VALUE_SOURCE = String.raw`\/\/(?!\/\/(?:[\t\n )]|$))[^\n]{1,1024}?\/\/(?=[\t\n )]|$)`;
+const REGEX_FILTER_VALUE_PATTERN = new RegExp(`^${REGEX_FILTER_VALUE_SOURCE}`);
+// Sentry would parse `https://host/path// ` as a regex filter too, but no
+// attribute is named after a URL scheme, so treat those as plain text.
+const URL_SCHEME_KEY_SOURCE =
+  String.raw`(?:https?|wss?|s?ftp|file|s3|gs):`.replace(
+    /[a-z]/g,
+    (letter) => `[${letter}${letter.toUpperCase()}]`,
+  );
+// Array membership on an explicit tag goes inside the brackets,
+// `tags[k[*],array]`, as in Sentry's `array_includes_tag_key` rule.
+const REGEX_FILTER_KEY_SOURCE = String.raw`(^|[\s()"])!?(?<regexKey>(?:tags|flags)\[[\w.:-]+(?:\[\*\])?(?: *, *(?:string|number|boolean|array))?\]|"[\w.:-]+"(?:\[\*\])?|(?!${URL_SCHEME_KEY_SOURCE})[A-Za-z_][A-Za-z0-9_.[\],-]*(?:\[\*\])?):`;
+const REGEX_FILTER_KEY_BEFORE_PATTERN = new RegExp(
+  `${REGEX_FILTER_KEY_SOURCE}$`,
+);
+const REGEX_FILTER_KEY_SCAN_LIMIT = 256;
+const SEARCH_FILTER_KEY_SOURCE = String.raw`(^|\s)!?(?<key>[A-Za-z_][A-Za-z0-9_.[\],-]*):`;
+// Used by the semantic-downgrade comparison below, which still scans the raw
+// query text. `looksLikeSentrySearchSyntax` parses with the shared grammar.
+const SENTRY_SEARCH_TOKEN_WITH_REGEX_PATTERN = new RegExp(
+  String.raw`${REGEX_FILTER_KEY_SOURCE}(?=${REGEX_FILTER_VALUE_SOURCE})|${SEARCH_FILTER_KEY_SOURCE}(?=\S)(?!\/\/)`,
+  "g",
+);
+// Sentry would parse `https://host/path// ` as a regex filter too; see
+// URL_SCHEME_KEY_SOURCE.
+const URL_SCHEME_KEY_PATTERN = /^(?:https?|wss?|s?ftp|file|s3|gs)$/i;
+const LINE_BREAK_PATTERN = /[\r\n]+/g;
+const KNOWN_SENTRY_SEARCH_KEYS = new Set([
+  "browser",
+  "device",
+  "duration",
+  "environment",
+  "error.type",
+  "http.status_code",
+  "issue",
+  "level",
+  "message",
+  "os",
+  "project",
+  "release",
+  "severity",
+  "span.action",
+  "span.description",
+  "span.module",
+  "span.op",
+  "span.status",
+  "timestamp",
+  "trace",
+  "transaction",
+  "transaction.duration",
+  "transaction.op",
+  "url",
+  "user",
+  "user.email",
+  "user.id",
+  "user.username",
+]);
+
+// Helper to safely get a string value from event data
+export function getStringValue(
+  event: FlexibleEventData,
+  key: string,
+  defaultValue = "",
+): string {
+  const value = event[key];
+  return typeof value === "string" ? value : defaultValue;
+}
+
+// Helper to safely get a number value from event data
+export function getNumberValue(
+  event: FlexibleEventData,
+  key: string,
+): number | undefined {
+  const value = event[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+// Helper to check if fields contain aggregate functions
+export function isAggregateQuery(fields: readonly string[]): boolean {
+  return fields.some(isAggregateFieldOrEquation);
+}
+
+type SearchSyntaxDataset = EventsDataset | "replays" | "issues";
+
+// Issue search keys are camelCase, unlike event attributes.
+const ISSUE_SEARCH_MIXED_CASE_KEYS = new Set([
+  "activeSince",
+  "firstRelease",
+  "firstSeen",
+  "lastSeen",
+  "timesSeen",
+  "userCount",
+]);
+
+/** Every filter token, including those inside parenthesized groups. */
+function* filterTokens(
+  tokens: readonly ParseResultToken[],
+): Generator<FilterToken> {
+  for (const token of tokens) {
+    if (token.type === Token.FILTER) {
+      yield token;
+    } else if (token.type === Token.LOGIC_GROUP) {
+      yield* filterTokens(token.inner);
+    }
+  }
+}
+
+/**
+ * Whether a parsed filter is Sentry search syntax rather than prose that
+ * happens to contain a colon, like `Note: ...`, `10:30`, or a URL.
+ */
+function isStructuredFilter(
+  query: string,
+  filter: FilterToken,
+  dataset?: SearchSyntaxDataset,
+): boolean {
+  const key = query.slice(
+    filter.key.location.start.offset,
+    filter.key.location.end.offset,
+  );
+
+  if (filter.operator === TermOperator.MATCHES) {
+    // No attribute is named after a URL scheme, so `https://host/path//` is
+    // prose even where Sentry would read it as a regex.
+    return !(
+      filter.key.type === Token.KEY_SIMPLE && URL_SCHEME_KEY_PATTERN.test(key)
+    );
+  }
+
+  const value = query.slice(
+    filter.key.location.end.offset + 1,
+    filter.location.end.offset,
+  );
+  // An empty value is `Word: ...`; a `//` value is a URL, or a regex on a
+  // dataset that matches it as literal text.
+  if (!value || value.startsWith("//") || !/^[A-Za-z_]/.test(key)) {
+    return false;
+  }
+
+  if (filter.key.type === Token.KEY_AGGREGATE || /^tags\[[^\]]+\]$/.test(key)) {
+    return true;
+  }
+
+  if (dataset === "issues" && ISSUE_SEARCH_MIXED_CASE_KEYS.has(key)) {
+    return true;
+  }
+
+  if (key !== key.toLowerCase()) {
+    return false;
+  }
+
+  return (
+    KNOWN_SENTRY_SEARCH_KEYS.has(key) ||
+    /[.[\],]/.test(key) ||
+    /^[a-z_][a-z0-9_-]*$/.test(key)
+  );
+}
+
+export function looksLikeSentrySearchSyntax(
+  query?: string,
+  dataset?: SearchSyntaxDataset,
+): boolean {
+  // The grammar rejects line breaks outside quotes; they only separate terms.
+  const trimmedQuery = query?.trim().replace(LINE_BREAK_PATTERN, " ");
+  if (!trimmedQuery) {
+    return false;
+  }
+
+  // Sentry only honors key://pattern// as a regex on logs; other datasets
+  // match the literal text //pattern//.
+  const tokens = parseSearch(trimmedQuery, {
+    config: { allowRegex: dataset === "logs" },
+  });
+  if (!tokens) {
+    return false;
+  }
+
+  for (const filter of filterTokens(tokens)) {
+    if (isStructuredFilter(trimmedQuery, filter, dataset)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Note for an untranslated query that ran as literal text and matched nothing.
+ *
+ * Only multi-word queries without Sentry filters or quotes get the note, so
+ * single terms, quoted phrases, and structured searches stay unchanged.
+ */
+export function formatUntranslatedQueryNote(
+  query: string | undefined,
+  syntaxExample: string,
+  dataset?: SearchSyntaxDataset,
+): string | null {
+  const trimmedQuery = query?.trim() ?? "";
+  if (
+    !/\s/.test(trimmedQuery) ||
+    trimmedQuery.includes('"') ||
+    looksLikeSentrySearchSyntax(trimmedQuery, dataset)
+  ) {
+    return null;
+  }
+  return `\`query\` was not translated from natural language because no embedded agent or Seer translation was available, so Sentry searched for it as literal text and found nothing. Retry with Sentry search syntax, such as \`${syntaxExample}\`, and use \`period\` for the time range.`;
+}
+
+export function readRegexFilterValue(
+  query: string,
+  index: number,
+): string | undefined {
+  if (!query.startsWith("//", index) || query[index - 1] !== ":") {
+    return undefined;
+  }
+  // Callers probe every index, so only scan a bounded key-sized prefix; the
+  // NUL stands in for truncated text so `^` can't match mid-query.
+  const start = Math.max(0, index - REGEX_FILTER_KEY_SCAN_LIMIT);
+  const prefix = `${start > 0 ? "\0" : ""}${query.slice(start, index)}`;
+  if (!REGEX_FILTER_KEY_BEFORE_PATTERN.test(prefix)) {
+    return undefined;
+  }
+  return REGEX_FILTER_VALUE_PATTERN.exec(query.slice(index))?.[0];
+}
+
+const FULL_TEXT_SEARCH_KEYS = new Set(["message", "log.body"]);
+
+/**
+ * Replace quoted regions and regex values with same-length placeholders so
+ * colons inside them are not treated as filter-key separators (e.g.
+ * transaction:"handle message:hello"). Length is preserved so offsets still
+ * map back to the original query.
+ */
+function maskQuotedRegions(query: string): string {
+  let out = "";
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+
+  for (let i = 0; i < query.length; i += 1) {
+    const char = query[i];
+    if (escaped) {
+      escaped = false;
+      out += quote ? "x" : char;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      out += quote ? "x" : char;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+        out += char;
+      } else {
+        // Keep length; neutralize token separators inside quotes.
+        out += char === ":" || /\s/.test(char) ? "x" : char;
+      }
+      continue;
+    }
+    const regexValue = readRegexFilterValue(query, i);
+    if (regexValue) {
+      out += `//${regexValue.slice(2, -2).replace(/[:\s]/g, "x")}//`;
+      i += regexValue.length - 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      out += char;
+      continue;
+    }
+    out += char;
+  }
+
+  return out;
+}
+
+type SearchFilterOccurrence = {
+  key: string;
+  value: string;
+  regex: boolean;
+};
+
+function normalizeFilterValue(rawValue: string): string {
+  return rawValue
+    .replace(/^['"]|['"]$/g, "")
+    .replace(/^\*+|\*+$/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Read one filter value starting at `valueStart` in the original query.
+ * Quoted values keep interior whitespace; unquoted values stop at whitespace.
+ */
+function readRawFilterValue(
+  query: string,
+  valueStart: number,
+): string | undefined {
+  if (valueStart >= query.length) {
+    return undefined;
+  }
+
+  const first = query[valueStart];
+  if (first === '"' || first === "'") {
+    let escaped = false;
+    for (let i = valueStart + 1; i < query.length; i += 1) {
+      const char = query[i];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === first) {
+        return query.slice(valueStart, i + 1);
+      }
+    }
+    // Unclosed quote: take the remainder so comparison still sees later words.
+    return query.slice(valueStart);
+  }
+
+  const valueMatch = query.slice(valueStart).match(/^\S+/);
+  return valueMatch?.[0];
+}
+
+/**
+ * Extract every field:value occurrence while preserving multiplicity and quote
+ * boundaries. Values are normalized for comparison (strip wrapping quotes and
+ * leading/trailing wildcards).
+ */
+function searchFilterOccurrences(query: string): SearchFilterOccurrence[] {
+  const occurrences: SearchFilterOccurrence[] = [];
+  const masked = maskQuotedRegions(query);
+
+  // Read key://pattern// on every dataset: outside logs it is a literal match,
+  // so a structured filter rewritten into one is still a downgrade.
+  for (const match of masked.matchAll(SENTRY_SEARCH_TOKEN_WITH_REGEX_PATTERN)) {
+    const key = (match.groups?.regexKey ?? match.groups?.key)?.toLowerCase();
+    if (!key || match.index === undefined) {
+      continue;
+    }
+
+    // Read the real value from the original query at the same offset so quotes
+    // and multi-word quoted values are preserved before normalization.
+    const valueStart = match.index + match[0].length;
+    const regexValue = readRegexFilterValue(query, valueStart);
+    if (regexValue) {
+      occurrences.push({
+        key,
+        value: regexValue.slice(2, -2),
+        regex: true,
+      });
+      continue;
+    }
+
+    const rawValue = readRawFilterValue(query, valueStart);
+    if (!rawValue) {
+      continue;
+    }
+
+    const value = normalizeFilterValue(rawValue);
+    if (!value) {
+      continue;
+    }
+
+    occurrences.push({ key, value, regex: false });
+  }
+
+  return occurrences;
+}
+
+function structuredFilterOccurrences(query: string): SearchFilterOccurrence[] {
+  return searchFilterOccurrences(query).filter(
+    (occurrence) => !FULL_TEXT_SEARCH_KEYS.has(occurrence.key),
+  );
+}
+
+function fullTextFilterValues(query: string): string[] {
+  return searchFilterOccurrences(query)
+    .filter((occurrence) => FULL_TEXT_SEARCH_KEYS.has(occurrence.key))
+    .map((occurrence) => occurrence.value);
+}
+
+function filterOccurrenceIdentity(occurrence: SearchFilterOccurrence): string {
+  return `${occurrence.key}\0${occurrence.regex}\0${occurrence.value}`;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * True when `needle` appears in `haystack` as a whole token, not a bare
+ * substring. Prevents `id:1` from matching inside `message:"error 401"`.
+ */
+function containsAsWholeToken(haystack: string, needle: string): boolean {
+  if (!haystack || !needle) {
+    return false;
+  }
+  if (haystack === needle) {
+    return true;
+  }
+
+  const escaped = escapeRegExp(needle);
+  // Token edges are start/end or a non-alphanumeric/underscore char so short
+  // numeric fragments cannot match inside longer numbers.
+  return new RegExp(`(?:^|[^A-Za-z0-9_])${escaped}(?:$|[^A-Za-z0-9_])`).test(
+    haystack,
+  );
+}
+
+function isRelatedFilterValue(left: string, right: string): boolean {
+  const lowerLeft = left.toLowerCase();
+  const lowerRight = right.toLowerCase();
+  return (
+    containsAsWholeToken(lowerLeft, lowerRight) ||
+    containsAsWholeToken(lowerRight, lowerLeft)
+  );
+}
+
+/**
+ * Structured filters present in `original` that are not covered by multiset
+ * cardinality in `repaired` (same key+value pair counts).
+ */
+function unmatchedStructuredFilters(
+  original: SearchFilterOccurrence[],
+  repaired: SearchFilterOccurrence[],
+): SearchFilterOccurrence[] {
+  const remaining = new Map<string, number>();
+  for (const occurrence of repaired) {
+    const identity = filterOccurrenceIdentity(occurrence);
+    remaining.set(identity, (remaining.get(identity) ?? 0) + 1);
+  }
+
+  const unmatched: SearchFilterOccurrence[] = [];
+  for (const occurrence of original) {
+    const identity = filterOccurrenceIdentity(occurrence);
+    const count = remaining.get(identity) ?? 0;
+    if (count > 0) {
+      remaining.set(identity, count - 1);
+      continue;
+    }
+    unmatched.push(occurrence);
+  }
+
+  return unmatched;
+}
+
+function isRegexFilterDowngrade(
+  originalQuery: string,
+  repairedQuery: string,
+): boolean {
+  const originalRegexFilters = searchFilterOccurrences(originalQuery).filter(
+    (occurrence) => occurrence.regex,
+  );
+  if (originalRegexFilters.length === 0) {
+    return false;
+  }
+
+  const repairedFilters = searchFilterOccurrences(repairedQuery);
+  const maskedRepairedQuery = maskQuotedRegions(repairedQuery);
+  return unmatchedStructuredFilters(originalRegexFilters, repairedFilters).some(
+    (filter) =>
+      new RegExp(
+        String.raw`(?:^|[\s()"])!?${escapeRegExp(filter.key)}:(?!\/\/)`,
+        "i",
+      ).test(maskedRepairedQuery) ||
+      repairedFilters.some(
+        (repaired) =>
+          repaired.key === filter.key ||
+          (FULL_TEXT_SEARCH_KEYS.has(repaired.key) &&
+            isRelatedFilterValue(filter.value, repaired.value)),
+      ),
+  );
+}
+
+/**
+ * True when a structured field:value filter was replaced with message/log.body
+ * full-text matching (false-success path), or a logs `key://pattern//` regex
+ * filter was replaced with a plain or wildcard filter. Allows real attribute renames.
+ *
+ * Uses multiset key+value matching so dropping one of several identical keys
+ * (e.g. `custom:foo custom:bar` → `custom:bar message:"*foo*"`) is still caught.
+ * Value comparison is whole-token, not bare substring, so unrelated full-text
+ * (e.g. `id:1` vs `message:"error 401"`) is not treated as a downgrade.
+ */
+export function isSemanticFilterDowngrade(
+  originalQuery: string,
+  repairedQuery: string,
+  dataset?: SearchSyntaxDataset,
+): boolean {
+  if (!looksLikeSentrySearchSyntax(originalQuery, dataset)) {
+    return false;
+  }
+
+  if (
+    dataset === "logs" &&
+    isRegexFilterDowngrade(originalQuery, repairedQuery)
+  ) {
+    return true;
+  }
+
+  const originalFilters = structuredFilterOccurrences(originalQuery);
+  if (originalFilters.length === 0) {
+    return false;
+  }
+
+  const repairedFilters = structuredFilterOccurrences(repairedQuery);
+  const droppedFilters = unmatchedStructuredFilters(
+    originalFilters,
+    repairedFilters,
+  );
+  if (droppedFilters.length === 0) {
+    return false;
+  }
+
+  const repairedFullTextValues = fullTextFilterValues(repairedQuery);
+  if (repairedFullTextValues.length === 0) {
+    // Renames keep values on non-full-text attributes and do not need this guard.
+    return false;
+  }
+
+  return droppedFilters.some((filter) =>
+    repairedFullTextValues.some((fullTextValue) =>
+      isRelatedFilterValue(filter.value, fullTextValue),
+    ),
+  );
+}
+
+function isPrimitive(
+  value: unknown,
+): value is string | number | boolean | null {
+  return (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  );
+}
+
+function isTagPair(value: unknown): value is { key: string; value: unknown } {
+  return (
+    isPlainObject(value) && typeof value.key === "string" && "value" in value
+  );
+}
+
+const USER_FIELDS = [
+  "id",
+  "email",
+  "username",
+  "ip_address",
+  "name",
+  "display_name",
+] as const;
+const USER_IDENTITY_FIELDS = new Set([
+  "email",
+  "username",
+  "ip_address",
+  "name",
+  "display_name",
+]);
+
+function hasUserIdentityFields(value: Record<string, unknown>): boolean {
+  return USER_FIELDS.some(
+    (f) => USER_IDENTITY_FIELDS.has(f) && value[f] != null,
+  );
+}
+
+function hasUserSummaryFields(
+  value: Record<string, unknown>,
+  options: { allowId?: boolean } = {},
+): boolean {
+  return (
+    hasUserIdentityFields(value) ||
+    (options.allowId === true && value.id != null)
+  );
+}
+
+function formatUserSummary(
+  value: Record<string, unknown>,
+  options: {
+    includeGeo?: boolean;
+    allowIdOnly?: boolean;
+  } = {},
+): string | null {
+  const includeGeo = options.includeGeo ?? true;
+  const allowIdOnly = options.allowIdOnly ?? false;
+  // Require at least one identity field to avoid matching arbitrary objects that just have "id"
+  const hasSummaryField = hasUserSummaryFields(value, { allowId: allowIdOnly });
+  if (!hasSummaryField) {
+    return null;
+  }
+
+  const parts = USER_FIELDS.filter((f) => value[f] != null).map(
+    (f) => `${f}=${formatSimpleValue(value[f])}`,
+  );
+  const geoSummary = formatUserGeoSummary(value.geo);
+  if (includeGeo && geoSummary) {
+    parts.push(`geo=${geoSummary}`);
+  }
+
+  return parts.length > 0 ? parts.join(", ") : null;
+}
+
+export function formatKnownUserValue(
+  value: Record<string, unknown>,
+  options: { includeGeo?: boolean } = {},
+): string | null {
+  return formatUserSummary(value, {
+    includeGeo: options.includeGeo,
+    allowIdOnly: true,
+  });
+}
+
+function sanitizeWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function truncateString(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  if (maxLength <= 3) {
+    return value.slice(0, maxLength);
+  }
+
+  return `${value.slice(0, maxLength - 3)}...`;
+}
+
+function safeJsonStringify(value: unknown): string {
+  const seen = new WeakSet<object>();
+  return JSON.stringify(value, (_key, currentValue) => {
+    if (typeof currentValue === "bigint") {
+      return currentValue.toString();
+    }
+
+    if (typeof currentValue === "function") {
+      return "[Function]";
+    }
+
+    if (typeof currentValue === "object" && currentValue !== null) {
+      if (seen.has(currentValue)) {
+        return "[Circular]";
+      }
+      seen.add(currentValue);
+    }
+
+    return currentValue;
+  });
+}
+
+function formatSimpleValue(value: unknown): string {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+
+  return safeJsonStringify(value);
+}
+
+function formatArrayValue(values: unknown[], maxLength: number): string {
+  if (values.length === 0) {
+    return "[]";
+  }
+
+  if (values.every(isTagPair)) {
+    const pairs = values.map(
+      (tag) => `${tag.key}=${formatSimpleValue(tag.value)}`,
+    );
+    return truncateString(sanitizeWhitespace(pairs.join(", ")), maxLength);
+  }
+
+  if (values.every(isPrimitive)) {
+    return truncateString(
+      sanitizeWhitespace(values.map((value) => String(value)).join(", ")),
+      maxLength,
+    );
+  }
+
+  const overflow = values.length > DEFAULT_MAX_ARRAY_ITEMS;
+  const limitedValues = overflow
+    ? values.slice(0, DEFAULT_MAX_ARRAY_ITEMS)
+    : values;
+  const jsonValue = safeJsonStringify(limitedValues);
+  const suffix = overflow
+    ? `, ...+${values.length - DEFAULT_MAX_ARRAY_ITEMS} more`
+    : "";
+
+  return truncateString(sanitizeWhitespace(`${jsonValue}${suffix}`), maxLength);
+}
+
+function formatObjectValue(
+  value: Record<string, unknown>,
+  maxLength: number,
+): string {
+  // Check tag pair first -- it's more specific than the user summary heuristic
+  if (isTagPair(value)) {
+    return truncateString(
+      sanitizeWhitespace(`${value.key}=${formatSimpleValue(value.value)}`),
+      maxLength,
+    );
+  }
+
+  const userSummary = formatUserSummary(value);
+  if (userSummary) {
+    return truncateString(sanitizeWhitespace(userSummary), maxLength);
+  }
+
+  return truncateString(
+    sanitizeWhitespace(safeJsonStringify(value)),
+    maxLength,
+  );
+}
+
+export function formatEventValue(
+  value: unknown,
+  options: {
+    maxLength?: number;
+  } = {},
+): string {
+  const maxLength = options.maxLength ?? DEFAULT_MAX_VALUE_LENGTH;
+
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+
+  if (typeof value === "string") {
+    return truncateString(sanitizeWhitespace(value), maxLength);
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+
+  if (Array.isArray(value)) {
+    return formatArrayValue(value, maxLength);
+  }
+
+  if (isPlainObject(value)) {
+    return formatObjectValue(value, maxLength);
+  }
+
+  if (typeof value === "bigint") {
+    return String(value);
+  }
+
+  return `<${typeof value}>`;
+}
+
+// Helper function to fetch custom attributes for a dataset
+export async function fetchCustomAttributes(
+  apiService: SentryApiService,
+  organizationSlug: string,
+  dataset: EventsDataset,
+  projectId?: string,
+  timeParams?: { statsPeriod?: string; start?: string; end?: string },
+  options: {
+    attributeTypes?: TraceItemAttributeType[];
+    substringMatch?: string;
+    query?: string;
+    context?: boolean;
+  } = {},
+): Promise<{
+  attributes: Record<string, Tag | TraceItemAttribute>;
+  fieldTypes: Record<string, TraceItemAttributeType>;
+}> {
+  const customAttributes: Record<string, Tag | TraceItemAttribute> = {};
+  const fieldTypes: Record<string, TraceItemAttributeType> = {};
+  const normalizedDataset = normalizeEventsDataset(dataset);
+  const attributeTimeParams = timeParams ?? { statsPeriod: "14d" };
+
+  if (normalizedDataset === "errors") {
+    // TODO: For errors dataset, we currently need to use the old listTags API
+    // This will be updated in the future to use the new trace-items attributes API
+    const tagsResponse = await apiService.listTags({
+      organizationSlug,
+      dataset: "events",
+      project: projectId,
+      statsPeriod: attributeTimeParams.statsPeriod,
+      start: attributeTimeParams.start,
+      end: attributeTimeParams.end,
+      useCache: true,
+      useFlagsBackend: true,
+    });
+
+    for (const tag of tagsResponse) {
+      if (tag.key && !tag.key.startsWith("sentry:")) {
+        customAttributes[tag.key] = { ...tag, name: tag.name || tag.key };
+      }
+    }
+  } else if (normalizedDataset === "profiles") {
+    // Profiles currently use a stable, product-defined field set rather than
+    // the trace-item attributes endpoint.
+    return { attributes: customAttributes, fieldTypes };
+  } else {
+    // For logs, spans, and trace metrics datasets, use the trace-items attributes endpoint
+    const itemType = getTraceItemType(normalizedDataset);
+    if (!itemType) {
+      return { attributes: customAttributes, fieldTypes };
+    }
+
+    const attributesResponse = await apiService.listTraceItemAttributes({
+      organizationSlug,
+      itemType,
+      project: projectId,
+      statsPeriod: attributeTimeParams.statsPeriod,
+      start: attributeTimeParams.start,
+      end: attributeTimeParams.end,
+      attributeTypes: options.attributeTypes,
+      substringMatch: options.substringMatch,
+      query: options.query,
+      context: options.context,
+    });
+
+    for (const attr of attributesResponse) {
+      if (attr.key && !attr.key.startsWith("sentry:")) {
+        customAttributes[attr.key] = { ...attr, name: attr.name || attr.key };
+        // Track field type from the attribute response with validation
+        if (attr.type) {
+          fieldTypes[attr.key] = attr.type;
+        }
+      }
+    }
+  }
+
+  return { attributes: customAttributes, fieldTypes };
+}
+
+function getTraceItemType(dataset: EventsDataset): TraceItemType | null {
+  const normalizedDataset = normalizeEventsDataset(dataset);
+  if (normalizedDataset === "logs") {
+    return "logs";
+  }
+  if (normalizedDataset === "tracemetrics") {
+    return "tracemetrics";
+  }
+  if (normalizedDataset === "spans") {
+    return "spans";
+  }
+  return null;
+}
+
+function formatValidationStatusLine({
+  valid,
+  name,
+  type,
+  error,
+  indent = 0,
+}: {
+  valid: boolean;
+  name?: string;
+  type?: string;
+  error?: string;
+  indent?: number;
+}): string {
+  const status = valid ? "OK" : "INVALID";
+  const label = name ? ` ${name}` : "";
+  const prefix = `${" ".repeat(indent)}- ${status}${label}`;
+
+  if (valid && type) {
+    return `${prefix} — type: ${type}`;
+  }
+  if (error) {
+    return `${prefix} — ${error}`;
+  }
+  return prefix;
+}
+
+function formatQueryValidation(
+  query: EventsQueryValidation,
+  failuresOnly: boolean,
+): string[] {
+  const invalidFields = query.fields.filter((field) => !field.valid);
+  const visibleFields = failuresOnly ? invalidFields : query.fields;
+  const showQueryLine = failuresOnly
+    ? !query.valid || invalidFields.length > 0
+    : !query.valid || query.fields.length > 0;
+
+  if (!showQueryLine) {
+    return [];
+  }
+
+  const lines: string[] = [];
+  if (!query.valid) {
+    lines.push(
+      formatValidationStatusLine({
+        valid: false,
+        name: "query",
+        error: query.error,
+      }),
+    );
+  } else {
+    lines.push(formatValidationStatusLine({ valid: true, name: "query" }));
+  }
+
+  lines.push(
+    ...visibleFields.map((field) =>
+      formatValidationStatusLine({ ...field, indent: 2 }),
+    ),
+  );
+  return lines;
+}
+
+function pushValidationSection(
+  sections: string[],
+  title: string,
+  items: ReadonlyArray<{
+    valid: boolean;
+    name?: string;
+    type?: string;
+    error?: string;
+  }>,
+  failuresOnly: boolean,
+): void {
+  const visibleItems = failuresOnly
+    ? items.filter((item) => !item.valid)
+    : items;
+  if (visibleItems.length === 0) {
+    return;
+  }
+
+  sections.push(
+    `Validated ${title}:\n${visibleItems.map((item) => formatValidationStatusLine(item)).join("\n")}`,
+  );
+}
+
+export function formatEventsValidationResults(
+  validationResults: EventsValidationResult,
+): string {
+  const failuresOnly = !validationResults.valid;
+  const sections: string[] = [];
+
+  pushValidationSection(
+    sections,
+    "Projects",
+    validationResults.projects,
+    failuresOnly,
+  );
+  pushValidationSection(
+    sections,
+    "Dataset",
+    validationResults.dataset,
+    failuresOnly,
+  );
+  pushValidationSection(
+    sections,
+    "Environment",
+    validationResults.environment,
+    failuresOnly,
+  );
+  pushValidationSection(
+    sections,
+    "Fields",
+    validationResults.field,
+    failuresOnly,
+  );
+
+  const queryLines = formatQueryValidation(
+    validationResults.query,
+    failuresOnly,
+  );
+  if (queryLines.length > 0) {
+    sections.push(`Validated Query:\n${queryLines.join("\n")}`);
+  }
+
+  pushValidationSection(
+    sections,
+    "Order By",
+    validationResults.orderby,
+    failuresOnly,
+  );
+
+  if (sections.length === 0) {
+    return "";
+  }
+
+  const overall = validationResults.valid ? "valid" : "invalid";
+  const details = sections.join("\n\n");
+  return `Validation Result: ${overall}\n${details}\n`;
+}
+
+const VALIDATION_OUTPUT_MAX_LENGTH = 1024;
+
+function truncateValidationOutput(output: string): string {
+  if (output.length <= VALIDATION_OUTPUT_MAX_LENGTH) {
+    return output;
+  }
+  return `${output.slice(0, VALIDATION_OUTPUT_MAX_LENGTH)}…`;
+}
+
+export function recordEventsSearchValidationTelemetry({
+  attempt,
+  repairIteration,
+  validation,
+}: {
+  attempt: number;
+  repairIteration?: number;
+  validation: EventsValidationResult;
+}): void {
+  const span = getActiveSpan();
+  if (!span) {
+    return;
+  }
+
+  span.setAttribute("app.search_events.validation.attempt", attempt);
+  span.setAttribute("app.search_events.validation.valid", validation.valid);
+  if (repairIteration !== undefined) {
+    span.setAttribute(
+      "app.search_events.validation.repair_iteration",
+      repairIteration,
+    );
+  }
+
+  const formatted = formatEventsValidationResults(validation);
+  if (formatted) {
+    span.setAttribute(
+      "app.search_events.validation.output",
+      truncateValidationOutput(formatted),
+    );
+  }
+}
+
+export async function validateEventsSearch(
+  apiService: SentryApiService,
+  {
+    organizationSlug,
+    dataset,
+    fields,
+    query,
+    sort,
+    projectId,
+    environment,
+    statsPeriod,
+    start,
+    end,
+  }: {
+    organizationSlug: string;
+    dataset: EventsDataset;
+    fields: string[];
+    query: string;
+    sort: string;
+    projectId?: string;
+    environment?: string | string[];
+    statsPeriod?: string;
+    start?: string;
+    end?: string;
+  },
+): Promise<EventsValidationResult> {
+  return await apiService.validateEvents({
+    organizationSlug,
+    dataset,
+    fields,
+    query,
+    orderby: [sort],
+    project: projectId,
+    environment,
+    statsPeriod,
+    start,
+    end,
+  });
+}
+
+export async function assertEventsSearchIsValid(
+  apiService: SentryApiService,
+  {
+    organizationSlug,
+    dataset,
+    fields,
+    query,
+    sort,
+    projectId,
+    environment,
+    statsPeriod,
+    start,
+    end,
+  }: {
+    organizationSlug: string;
+    dataset: EventsDataset;
+    fields: string[];
+    query: string;
+    sort: string;
+    projectId?: string;
+    environment?: string | string[];
+    statsPeriod?: string;
+    start?: string;
+    end?: string;
+  },
+): Promise<void> {
+  const validationResults = await validateEventsSearch(apiService, {
+    organizationSlug,
+    dataset,
+    fields,
+    query,
+    sort,
+    projectId,
+    environment,
+    statsPeriod,
+    start,
+    end,
+  });
+
+  if (!validationResults.valid) {
+    const formatted = formatEventsValidationResults(validationResults);
+    throw new UserInputError(
+      formatted
+        ? `Search validation failed:\n${formatted}`
+        : "Search validation failed.",
+    );
+  }
+}
+
+/**
+ * Describes an attribute the agent can query, from either the static field config or the
+ * attributes API. `context` carries semantic convention details when available.
+ */
+type AttributeDescriptor = {
+  key: string;
+  name: string;
+  context?: TraceItemAttributeContext;
+};
+
+/**
+ * Convert static `{ key: description }` field config into the same
+ * `{ key: { key, name } }` shape returned by fetchCustomAttributes
+ */
+function toAttributeRecord(
+  fields: Record<string, string>,
+): Record<string, AttributeDescriptor> {
+  return Object.fromEntries(
+    Object.entries(fields).map(([key, name]) => [key, { key, name }]),
+  );
+}
+
+/**
+ * Swap each deprecated key for its replacement key when available,
+ * otherwise remove the deprecated attribute from the available attributes.
+ */
+function resolveAvailableFields(
+  fields: Record<string, AttributeDescriptor>,
+  fieldTypes: Record<string, TraceItemAttributeType>,
+): {
+  available: Map<string, AttributeDescriptor>;
+  replaced: AttributeDescriptor[];
+  updatedFieldTypes: Record<string, TraceItemAttributeType>;
+} {
+  const available = new Map<string, AttributeDescriptor>();
+  const replaced: AttributeDescriptor[] = [];
+
+  for (const [key, field] of Object.entries(fields)) {
+    const attributeDeprecated = field.context?.isDeprecated;
+    const replacementKey =
+      attributeDeprecated && field.context
+        ? field.context.replacementAttribute
+        : undefined;
+    if (attributeDeprecated && !replacementKey) {
+      continue;
+    } else if (attributeDeprecated && replacementKey) {
+      const replacementAttribute = { ...field, key: replacementKey };
+      available.set(replacementKey, replacementAttribute);
+      replaced.push(field);
+      fieldTypes[replacementKey] = fieldTypes[key];
+      delete fieldTypes[key];
+    } else if (!attributeDeprecated && !available.has(key)) {
+      available.set(key, field);
+    }
+  }
+
+  return { available, replaced, updatedFieldTypes: fieldTypes };
+}
+
+/**
+ * Describe a field for the agent with examples is provided.
+ */
+function describeField(field: AttributeDescriptor): string {
+  const { context } = field;
+  const parts: string[] = [];
+
+  parts.push(context?.brief || field.name);
+  if (context?.examples?.length) {
+    parts.push(`Examples: ${context.examples.join(", ")}.`);
+  }
+
+  return parts.join(" ");
+}
+
+/**
+ * Create a tool for the agent to query available attributes by dataset
+ * The tool is pre-bound with the API service and organization configured for the appropriate region
+ */
+export function createDatasetAttributesTool(options: {
+  apiService: SentryApiService;
+  organizationSlug: string;
+  projectId?: string;
+}) {
+  const { apiService, organizationSlug, projectId } = options;
+  const traceItemAttributeTypeSchema = z.enum([
+    "string",
+    "number",
+    "boolean",
+    "array",
+  ]);
+
+  return agentTool({
+    description:
+      "Query and filter available attributes and fields for a specific Sentry dataset to understand what data is available",
+    parameters: z.object({
+      dataset: z
+        .enum(PUBLIC_EVENTS_DATASETS)
+        .describe("The dataset to query attributes for"),
+      substringMatch: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe("Optional substring to find matching attribute names"),
+      query: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          "Optional Sentry search query to list attributes available for that filtered result set",
+        ),
+      attributeTypes: z
+        .array(traceItemAttributeTypeSchema)
+        .min(1)
+        .optional()
+        .describe(
+          "Optional attribute types to list. Use ['string','number','boolean'] when unsure.",
+        ),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe(
+          "Optional position in the Available Fields list to start from. Use the offset given at the end of the previous response to see the next page of fields.",
+        ),
+    }),
+    execute: async ({
+      dataset,
+      substringMatch,
+      query,
+      attributeTypes,
+      offset = 0,
+    }) => {
+      const {
+        BASE_COMMON_FIELDS,
+        DATASET_FIELDS,
+        RECOMMENDED_FIELDS,
+        NUMERIC_FIELDS,
+        DATASET_EXAMPLES,
+      } = await import("./config");
+
+      // Get custom attributes for this dataset
+      // IMPORTANT: Let ALL errors bubble up to wrapAgentToolExecute
+      // UserInputError will be converted to error string for the AI agent
+      // Other errors will bubble up to be captured by Sentry
+      const normalizedDataset = normalizeEventsDataset(dataset);
+      const attributeTimeParams = { statsPeriod: "14d" };
+      const { attributes: customAttributes, fieldTypes } =
+        await fetchCustomAttributes(
+          apiService,
+          organizationSlug,
+          dataset,
+          projectId,
+          attributeTimeParams,
+          {
+            attributeTypes,
+            substringMatch,
+            query,
+            context: true,
+          },
+        );
+
+      let commonFields: Record<string, string> = {};
+      let datasetFields: Record<string, string> = {};
+      if (substringMatch) {
+        Object.entries(BASE_COMMON_FIELDS).forEach(([key, value]) => {
+          if (key.includes(substringMatch) || value.includes(substringMatch)) {
+            commonFields[key] = value;
+          }
+        });
+        Object.entries(DATASET_FIELDS[normalizedDataset]).forEach(
+          ([key, value]) => {
+            if (
+              key.includes(substringMatch) ||
+              value.includes(substringMatch)
+            ) {
+              datasetFields[key] = value;
+            }
+          },
+        );
+      } else {
+        commonFields = BASE_COMMON_FIELDS;
+        datasetFields = DATASET_FIELDS[normalizedDataset];
+      }
+
+      // Combine all available fields
+      const allFields: Record<string, AttributeDescriptor> = {
+        ...toAttributeRecord(commonFields),
+        ...toAttributeRecord(datasetFields),
+        ...customAttributes,
+      };
+
+      const {
+        available: availableFields,
+        replaced: replacedFields,
+        updatedFieldTypes,
+      } = resolveAvailableFields(allFields, fieldTypes);
+      const fieldCount = availableFields.size;
+
+      const recommendedFields = RECOMMENDED_FIELDS[normalizedDataset];
+
+      // Combine field types from both static config and dynamic API
+      const allFieldTypes: Record<string, TraceItemAttributeType> = {
+        ...updatedFieldTypes,
+      };
+      const staticNumericFields =
+        NUMERIC_FIELDS[normalizedDataset] || new Set();
+      for (const field of staticNumericFields) {
+        allFieldTypes[field] = "number";
+      }
+
+      recordAgentToolResultCount(fieldCount);
+
+      // Page through fields to avoid overwhelming the agent
+      const pageFields = [...availableFields].slice(
+        offset,
+        offset + FIELDS_PAGE_SIZE,
+      );
+      const pageEnd = offset + pageFields.length;
+      const fieldsHeader =
+        pageFields.length > 0
+          ? `Available Fields (${fieldCount} total, showing ${offset + 1}-${pageEnd}):`
+          : `Available Fields (${fieldCount} total):${offset > 0 ? ` none at offset ${offset}.` : ""}`;
+      const fieldsList = pageFields
+        .map(
+          ([key, field]) =>
+            `- ${key}${allFieldTypes[key] ? ` (${allFieldTypes[key]})` : ""}: ${describeField(field)}`,
+        )
+        .join("\n");
+      const nextPageHint =
+        pageEnd < fieldCount
+          ? `\n... and ${fieldCount - pageEnd} more fields. To see them, call datasetAttributes again with the same arguments and offset: ${pageEnd}`
+          : "";
+
+      // Later pages only list their fields; the deprecated fields, recommended
+      // fields, and examples were already returned with the first page.
+      if (offset > 0) {
+        return `Dataset: ${dataset}
+
+${fieldsHeader}
+${fieldsList}
+${nextPageHint}
+
+IMPORTANT: Only use numeric aggregate functions (avg, sum, min, max, percentiles) with numeric fields. Use count() or count_unique() for non-numeric fields.
+`;
+      }
+
+      return `Dataset: ${dataset}
+
+${fieldsHeader}
+${fieldsList}
+${nextPageHint}
+${
+  replacedFields.length > 0
+    ? `
+Deprecated Fields (do NOT use these, use the replacement instead):
+${replacedFields
+  .slice(0, 30)
+  .map((field) => `- ${field.key} → ${field.context?.replacementAttribute}`)
+  .join("\n")}
+${replacedFields.length > 30 ? `\n... and ${replacedFields.length - 30} more deprecated fields` : ""}`
+    : ""
+}
+Recommended Fields for ${dataset}:
+${recommendedFields.basic.map((f) => `- ${f}`).join("\n")}
+
+IMPORTANT: Only use numeric aggregate functions (avg, sum, min, max, percentiles) with numeric fields. Use count() or count_unique() for non-numeric fields.
+
+EXAMPLE QUERIES FOR ${dataset.toUpperCase()}:
+${DATASET_EXAMPLES[normalizedDataset]
+  .map((ex) => `- "${ex.description}" →\n  ${JSON.stringify(ex.output)}`)
+  .join("\n\n")}
+
+Use these examples as patterns for constructing your query.`;
+    },
+  });
+}
+
+/**
+ * Create a tool for the agent to validate a candidate events search before returning.
+ * Prefer this over external try/fail/retry orchestration in the tool handler.
+ */
+export function createValidateEventsSearchTool(options: {
+  apiService: SentryApiService;
+  organizationSlug: string;
+  projectId?: string;
+}) {
+  const { apiService, organizationSlug, projectId } = options;
+
+  return agentTool({
+    description:
+      "Validate a candidate Sentry events search before returning it. Call this after constructing dataset/query/fields/sort. If invalid, fix the request and validate again. Never replace a structured field:value filter with message/log.body full-text matching.",
+    parameters: z.object({
+      dataset: z
+        .enum(PUBLIC_EVENTS_DATASETS)
+        .describe("Dataset for the candidate search"),
+      query: z
+        .string()
+        .describe("Candidate Sentry search query string (may be empty)"),
+      fields: z
+        .array(z.string())
+        .min(1)
+        .describe(
+          "Candidate fields, including any aggregate functions and sort field",
+        ),
+      sort: z.string().min(1).describe("Candidate sort parameter"),
+      statsPeriod: z
+        .string()
+        .optional()
+        .describe("Optional relative time period like 1h, 24h, 7d"),
+      start: z.string().optional().describe("Optional ISO 8601 start time"),
+      end: z.string().optional().describe("Optional ISO 8601 end time"),
+    }),
+    execute: async ({
+      dataset,
+      query,
+      fields,
+      sort,
+      statsPeriod,
+      start,
+      end,
+    }) => {
+      const validation = await validateEventsSearch(apiService, {
+        organizationSlug,
+        dataset,
+        fields,
+        query,
+        sort,
+        projectId,
+        statsPeriod,
+        start,
+        end,
+      });
+
+      recordEventsSearchValidationTelemetry({
+        attempt: 0,
+        validation,
+      });
+
+      if (validation.valid) {
+        return {
+          valid: true,
+          message: "Search validation passed.",
+        };
+      }
+
+      const formatted = formatEventsValidationResults(validation);
+      return {
+        valid: false,
+        message: formatted
+          ? `Search validation failed:\n${formatted}`
+          : "Search validation failed.",
+      };
+    },
+  });
+}

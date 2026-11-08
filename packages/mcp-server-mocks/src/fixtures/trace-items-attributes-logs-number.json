@@ -1,0 +1,30 @@
+[
+  {
+    "key": "severity_number",
+    "name": "Severity Number"
+  },
+  {
+    "key": "sentry.observed_timestamp_nanos",
+    "name": "Observed Timestamp (Nanos)"
+  },
+  {
+    "key": "timestamp",
+    "name": "Timestamp"
+  },
+  {
+    "key": "custom.duration",
+    "name": "Custom Duration"
+  },
+  {
+    "key": "custom.bytes",
+    "name": "Custom Bytes"
+  },
+  {
+    "key": "worker.queue_wait",
+    "name": "worker.queue_wait"
+  },
+  {
+    "key": "worker.queue_wait_time",
+    "name": "worker.queue_wait_time"
+  }
+]
